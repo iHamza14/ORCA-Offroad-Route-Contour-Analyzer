@@ -200,7 +200,7 @@ IoU = Intersection / Union
 
 | Metric            | Value      |
 | ----------------- | ---------- |
-| Mean IoU          | ~0.69–0.70 |
+| Mean IoU          | ~0.74–0.88 |
 | Pixel Accuracy    | ~0.85      |
 | Inference Latency | ~4.7 ms    |
 | Throughput        | ~200 FPS   |

@@ -2,9 +2,8 @@
 
 ## Team Information
 
-**Team Name:** PixelRaiders
+**Team Name:** ORCA
 **Project:** Offroad Semantic Scene Segmentation  
-**Challenge:** Duality AI Code Sprint Hackathon
 
 ---
 
@@ -175,8 +174,8 @@ python visualize_segmentation.py --mode single --rgb path/to/image.png --seg pat
 
 ### Hyperparameters
 
-- **Batch Size:** 8
-- **Epochs:** 50
+- **Batch Size:** 15
+- **Epochs:** 100
 - **Learning Rate:** 0.001
 - **Optimizer:** Adam
 - **Loss Function:** Cross-Entropy Loss
@@ -204,9 +203,9 @@ python visualize_segmentation.py --mode single --rgb path/to/image.png --seg pat
 ### Expected Results
 
 - **Training Loss:** < 0.5 after 50 epochs
-- **Validation IoU:** 0.55 - 0.75 (depends on dataset quality)
+- **Validation IoU:** 0.55 - 0.85 (depends on dataset quality)
 - **Test mAP50:** 0.60 - 0.80 (mean Average Precision at IoU 0.5)
-- **Inference Time:** < 50ms per image (on GPU)
+- **Inference Time:** < 20ms per image (on GPU)
 
 ---
 

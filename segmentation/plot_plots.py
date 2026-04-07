@@ -78,7 +78,6 @@ plt.ylabel("Ground Truth")
 plt.xticks(rotation=45, ha="right")
 plt.yticks(rotation=0)
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "confusion_matrix.png"), dpi=200)
 plt.close()
 
 # ======================================================

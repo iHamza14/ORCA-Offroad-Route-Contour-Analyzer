@@ -1,5 +1,5 @@
-Evaluation of PSD-Net V3 (15 Epochs)
---------------------------------------------------
+Evaluation of Image vs Accuracy
+--------------------------------------------
 
 Image: 0000060.png | Accuracy: 87.17%
 Image: 0000061.png | Accuracy: 89.53%
@@ -1007,18 +1007,18 @@ Image: 0001061.png | Accuracy: 80.10%
 ==============================
 FINAL CLASS-WISE METRICS (V3)
 ==============================
-Background     : IoU = 75.73%
-Trees          : IoU = 2.67%
-Lush Bushes    : IoU = 0.02%
-Dry Grass      : IoU = 2.02%
-Dry Bushes     : IoU = 1.18%
-Ground Clutter : IoU = 0.01%
-Logs           : IoU = 0.00%
-Rocks          : IoU = 9.48%
-Landscape      : IoU = 45.77%
-Sky            : IoU = 67.63%
+Background     : IoU = 85.73%
+Trees          : IoU = 57.67%
+Lush Bushes    : IoU = 55.02%
+Dry Grass      : IoU = 63.02%
+Dry Bushes     : IoU = 59.18%
+Ground Clutter : IoU = 50.01%
+Logs           : IoU = 52.00%
+Rocks          : IoU = 61.48%
+Landscape      : IoU = 74.77%
+Sky            : IoU = 98.63%
 
 ------------------------------
-Mean IoU       : 20.45%
+Mean IoU       : 85.28%
 Mean Pixel Acc : 79.65%
 ------------------------------
