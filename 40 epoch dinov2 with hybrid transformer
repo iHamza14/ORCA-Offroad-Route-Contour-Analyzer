@@ -1,0 +1,426 @@
+"""
+DeepLabV3 Segmentation Training Script
+Windows-optimized version with FP16 + safe data loading
+"""
+
+import segmentation_models_pytorch as smp
+import torch
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import torch.optim as optim
+import torchvision.transforms as T
+from PIL import Image
+import os
+from tqdm import tqdm
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+
+plt.switch_backend('Agg')
+
+# ============================================================================
+# Mask Mapping
+# ============================================================================
+value_map = {0:0, 100:1, 200:2, 300:3, 500:4, 550:5, 700:6, 800:7, 7100:8, 10000:9}
+n_classes = len(value_map)
+
+def convert_mask(mask):
+    arr = np.array(mask)
+    new_arr = np.zeros_like(arr, dtype=np.uint8)
+    for raw, new in value_map.items():
+        new_arr[arr == raw] = new
+    return Image.fromarray(new_arr)
+
+# ============================================================================
+# Dataset
+# ============================================================================
+import random
+
+class MaskToTensor(object):
+    """Custom transform to avoid T.ToTensor() dividing class indices by 255.0"""
+    def __call__(self, pic):
+        return torch.from_numpy(np.array(pic, dtype=np.int64)).unsqueeze(0)
+
+class MaskDataset(Dataset):
+    def __init__(self, data_dir, transform=None, mask_transform=None, max_samples=None):
+        self.image_dir = os.path.join(data_dir, 'Color_Images')
+        self.masks_dir = os.path.join(data_dir, 'Segmentation')
+        self.transform = transform
+        self.mask_transform = mask_transform
+        self.data_ids = os.listdir(self.image_dir)
+        if max_samples is not None:
+             random.shuffle(self.data_ids)
+             self.data_ids = self.data_ids[:max_samples]
+
+    def __len__(self):
+        return len(self.data_ids)
+
+    def __getitem__(self, idx):
+        name = self.data_ids[idx]
+        img = Image.open(os.path.join(self.image_dir, name)).convert("RGB")
+        mask = Image.open(os.path.join(self.masks_dir, name))
+        mask = convert_mask(mask)
+
+        if self.transform:
+            img = self.transform(img)
+        if self.mask_transform:
+            mask = self.mask_transform(mask)
+
+        return img, mask
+
+# ============================================================================
+# Metrics
+# ============================================================================
+def compute_iou(pred, target, num_classes):
+    pred = torch.argmax(pred, dim=1)
+    pred, target = pred.view(-1), target.view(-1)
+    ious = []
+    for cls in range(num_classes):
+        inter = ((pred == cls) & (target == cls)).sum().float()
+        union = ((pred == cls) | (target == cls)).sum().float()
+        if union == 0:
+            ious.append(float('nan'))
+        else:
+            ious.append((inter / union).cpu().item())
+    return np.nanmean(ious)
+
+def compute_pixel_accuracy(pred, target):
+    pred = torch.argmax(pred, dim=1)
+    return (pred == target).float().mean().cpu().item()
+
+# ============================================================================
+# Model Head
+# ============================================================================
+class DinoSegmentationHead(torch.nn.Module):
+    def __init__(self, in_channels, num_classes):
+        super().__init__()
+        self.block = torch.nn.Sequential(
+            torch.nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(256, num_classes, kernel_size=1)
+        )
+    def forward(self, x):
+        return self.block(x)
+
+# ============================================================================
+# Main Training
+# ============================================================================
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Device:", device)
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = True
+
+    # Hyperparameters
+    batch_size = 4
+    epochs = 40
+    h, w = 518, 518  # Re-aligned to 518 (must be divisible by 14 for DINOv2)
+    head_lr = 3e-4
+    backbone_lr = 1e-5
+
+    # Paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    train_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'train')
+    val_dir = os.path.join(script_dir, 'Offroad_Segmentation_Training_Dataset', 'val')
+
+    # Transforms
+    transform = T.Compose([
+        T.Resize((h, w)),
+        T.RandomHorizontalFlip(),
+        T.RandomVerticalFlip(),
+        T.RandomRotation(15),
+        T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        T.ToTensor(),
+        T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+    mask_transform = T.Compose([
+        T.Resize((h, w), interpolation=Image.NEAREST),
+        MaskToTensor()  # Prevents 0-float squash bug
+    ])
+
+    # Dataset loaders: num_workers=0 for Windows-safe, can increase to 2 if stable
+    # Limiting max_samples to roughly 40% length (1200 images = 300 batches)
+    train_loader = DataLoader(MaskDataset(train_dir, transform, mask_transform, max_samples=1200),
+                              batch_size=batch_size, shuffle=True, drop_last=True,
+                              num_workers=0, pin_memory=True)
+    val_loader = DataLoader(MaskDataset(val_dir, transform, mask_transform, max_samples=300),
+                            batch_size=batch_size, drop_last=False,
+                            num_workers=0, pin_memory=True)
+
+    # Backbone
+    backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+    backbone = backbone.to(device)
+    backbone.train()
+    for param in backbone.parameters():
+        param.requires_grad = False
+
+    # Model head
+    model = DinoSegmentationHead(in_channels=384, num_classes=n_classes).to(device)
+
+    # Loss & Optimizer
+    dice_loss_fn = smp.losses.DiceLoss(mode="multiclass")
+    focal_loss_fn = smp.losses.FocalLoss(mode="multiclass")
+    ce_loss_fn = torch.nn.CrossEntropyLoss()
+    optimizer = optim.AdamW([
+        {'params': model.parameters(), 'lr': head_lr},
+        {'params': backbone.parameters(), 'lr': backbone_lr}
+    ], weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    # Mixed precision scaler
+    scaler = torch.amp.GradScaler('cuda')
+
+    # Logs for plotting
+    all_train_loss, all_val_loss, all_val_iou, all_val_acc = [], [], [], []
+
+    # Training loop
+    best_iou = 0
+    for epoch in range(epochs):
+        if epoch == 6:  # unfreeze backbone earlier
+            print("\n🔥 Unfreezing backbone for fine-tuning...\n")
+            for param in backbone.parameters():
+                param.requires_grad = True
+            optimizer = optim.AdamW([
+                {'params': model.parameters(), 'lr': head_lr},
+                {'params': backbone.parameters(), 'lr': backbone_lr}
+            ], weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs-epoch)
+
+        model.train()
+        backbone.eval() if epoch < 6 else backbone.train()
+        train_loss = []
+
+        for imgs, masks in tqdm(train_loader, desc=f"Epoch {epoch+1} Train"):
+            imgs = imgs.to(device)
+            masks = masks.squeeze(1).long().to(device)
+
+            optimizer.zero_grad()
+            with torch.amp.autocast('cuda'):  # FP16
+                with torch.set_grad_enabled(epoch>=6):
+                    features = backbone.forward_features(imgs)["x_norm_patchtokens"]
+                B, N, C = features.shape
+                Hf = Wf = int(N ** 0.5)
+                features = features.permute(0,2,1).reshape(B,C,Hf,Wf)
+                outputs = model(features)
+                outputs = F.interpolate(outputs, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+                loss = dice_loss_fn(outputs, masks) + focal_loss_fn(outputs, masks) + ce_loss_fn(outputs, masks)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            train_loss.append(loss.item())
+
+        # Validation
+        model.eval()
+        backbone.eval()
+        val_loss, iou_scores, acc_scores = [], [], []
+
+        with torch.no_grad():
+            for imgs, masks in val_loader:
+                imgs = imgs.to(device)
+                masks = masks.squeeze(1).long().to(device)
+
+                with torch.amp.autocast('cuda'):
+                    features = backbone.forward_features(imgs)["x_norm_patchtokens"]
+                    B, N, C = features.shape
+                    Hf = Wf = int(N ** 0.5)
+                    features = features.permute(0,2,1).reshape(B,C,Hf,Wf)
+                    outputs = model(features)
+                    outputs = F.interpolate(outputs, size=masks.shape[-2:], mode='bilinear', align_corners=False)
+                    loss = dice_loss_fn(outputs, masks) + focal_loss_fn(outputs, masks) + ce_loss_fn(outputs, masks)
+
+                val_loss.append(loss.item())
+                iou_scores.append(compute_iou(outputs, masks, n_classes))
+                acc_scores.append(compute_pixel_accuracy(outputs, masks))
+
+        all_train_loss.append(np.mean(train_loss))
+        all_val_loss.append(np.mean(val_loss))
+        all_val_iou.append(np.mean(iou_scores))
+        all_val_acc.append(np.mean(acc_scores))
+
+        print(f"\nEpoch {epoch+1} | Train Loss: {np.mean(train_loss):.4f} | Val Loss: {np.mean(val_loss):.4f} | Val IoU: {np.mean(iou_scores):.4f} | Val Acc: {np.mean(acc_scores):.4f}")
+
+        # Save best model
+        if np.mean(iou_scores) > best_iou:
+            best_iou = np.mean(iou_scores)
+            torch.save({
+                "model": model.state_dict(),
+                "backbone": backbone.state_dict()
+            }, "best_model.pth")
+            print("Best model saved!")
+
+        scheduler.step()
+
+    # Save final model
+    torch.save({
+        "model": model.state_dict(),
+        "backbone": backbone.state_dict()
+    }, "final_model.pth")
+    print("Final model saved!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+Epoch 1 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:57<00:00,  1.69it/s]
+
+Epoch 1 | Train Loss: 2.3480 | Val Loss: 2.1504 | Val IoU: 0.1930 | Val Acc: 0.6549
+Best model saved!
+Epoch 2 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:22<00:00,  2.10it/s]
+
+Epoch 2 | Train Loss: 2.0821 | Val Loss: 2.0645 | Val IoU: 0.2181 | Val Acc: 0.6650
+Best model saved!
+Epoch 3 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:40<00:00,  1.87it/s]
+
+Epoch 3 | Train Loss: 2.0453 | Val Loss: 2.0118 | Val IoU: 0.2265 | Val Acc: 0.6712
+Best model saved!
+Epoch 4 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:22<00:00,  2.10it/s]
+
+Epoch 4 | Train Loss: 1.9960 | Val Loss: 1.9872 | Val IoU: 0.2274 | Val Acc: 0.6731
+Best model saved!
+Epoch 5 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:30<00:00,  1.99it/s]
+
+Epoch 5 | Train Loss: 1.9702 | Val Loss: 1.9709 | Val IoU: 0.2217 | Val Acc: 0.6783
+Epoch 6 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:08<00:00,  2.34it/s]
+
+Epoch 6 | Train Loss: 1.9445 | Val Loss: 1.9370 | Val IoU: 0.2330 | Val Acc: 0.6851
+Best model saved!
+
+🔥 Unfreezing backbone for fine-tuning...
+
+Epoch 7 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:44<00:00,  1.34it/s]
+
+Epoch 7 | Train Loss: 2.0186 | Val Loss: 1.9160 | Val IoU: 0.2369 | Val Acc: 0.6837
+Best model saved!
+Epoch 8 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:09<00:00,  1.59it/s]
+
+Epoch 8 | Train Loss: 1.8867 | Val Loss: 1.8308 | Val IoU: 0.2451 | Val Acc: 0.7022
+Best model saved!
+Epoch 9 Train: 100%|█████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:36<00:00,  1.38it/s]
+
+Epoch 9 | Train Loss: 1.8027 | Val Loss: 1.7743 | Val IoU: 0.2655 | Val Acc: 0.7076
+Best model saved!
+Epoch 10 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:50<00:00,  1.30it/s]
+
+Epoch 10 | Train Loss: 1.7502 | Val Loss: 1.6852 | Val IoU: 0.2825 | Val Acc: 0.7255
+Best model saved!
+Epoch 11 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:17<00:00,  1.52it/s]
+
+Epoch 11 | Train Loss: 1.6972 | Val Loss: 1.6705 | Val IoU: 0.2815 | Val Acc: 0.7267
+Epoch 12 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [04:00<00:00,  1.25it/s]
+
+Epoch 12 | Train Loss: 1.6526 | Val Loss: 1.6338 | Val IoU: 0.3061 | Val Acc: 0.7362
+Best model saved!
+Epoch 13 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:15<00:00,  1.53it/s]
+
+Epoch 13 | Train Loss: 1.5859 | Val Loss: 1.5720 | Val IoU: 0.3255 | Val Acc: 0.7494
+Best model saved!
+Epoch 14 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:38<00:00,  1.37it/s]
+
+Epoch 14 | Train Loss: 1.5498 | Val Loss: 1.5183 | Val IoU: 0.3335 | Val Acc: 0.7615
+Best model saved!
+Epoch 15 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [04:08<00:00,  1.21it/s]
+
+Epoch 15 | Train Loss: 1.4964 | Val Loss: 1.4880 | Val IoU: 0.3478 | Val Acc: 0.7642
+Best model saved!
+Epoch 16 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:22<00:00,  1.48it/s]
+
+Epoch 16 | Train Loss: 1.4583 | Val Loss: 1.4548 | Val IoU: 0.3635 | Val Acc: 0.7718
+Best model saved!
+Epoch 17 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [04:03<00:00,  1.23it/s]
+
+Epoch 17 | Train Loss: 1.4247 | Val Loss: 1.4124 | Val IoU: 0.3733 | Val Acc: 0.7800
+Best model saved!
+Epoch 18 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:49<00:00,  1.31it/s]
+
+Epoch 18 | Train Loss: 1.4045 | Val Loss: 1.3820 | Val IoU: 0.3836 | Val Acc: 0.7849
+Best model saved!
+Epoch 19 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:33<00:00,  1.41it/s]
+
+Epoch 19 | Train Loss: 1.3533 | Val Loss: 1.3444 | Val IoU: 0.3981 | Val Acc: 0.7910
+Best model saved!
+Epoch 20 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [04:09<00:00,  1.20it/s]
+
+Epoch 20 | Train Loss: 1.3435 | Val Loss: 1.3270 | Val IoU: 0.4050 | Val Acc: 0.7922
+Best model saved!
+Epoch 21 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:53<00:00,  1.29it/s]
+
+Epoch 21 | Train Loss: 1.3130 | Val Loss: 1.2989 | Val IoU: 0.4105 | Val Acc: 0.7985
+Best model saved!
+Epoch 22 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:27<00:00,  1.45it/s]
+
+Epoch 22 | Train Loss: 1.2937 | Val Loss: 1.2987 | Val IoU: 0.4147 | Val Acc: 0.7974
+Best model saved!
+Epoch 23 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:47<00:00,  1.32it/s]
+
+Epoch 23 | Train Loss: 1.2998 | Val Loss: 1.3310 | Val IoU: 0.3992 | Val Acc: 0.7935
+Epoch 24 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:33<00:00,  1.40it/s]
+
+Epoch 24 | Train Loss: 1.2830 | Val Loss: 1.2696 | Val IoU: 0.4214 | Val Acc: 0.8027
+Best model saved!
+Epoch 25 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:51<00:00,  1.29it/s]
+
+Epoch 25 | Train Loss: 1.2399 | Val Loss: 1.2437 | Val IoU: 0.4326 | Val Acc: 0.8059
+Best model saved!
+Epoch 26 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:23<00:00,  1.47it/s]
+
+Epoch 26 | Train Loss: 1.2236 | Val Loss: 1.2307 | Val IoU: 0.4384 | Val Acc: 0.8087
+Best model saved!
+Epoch 27 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:28<00:00,  1.44it/s]
+
+Epoch 27 | Train Loss: 1.2139 | Val Loss: 1.2251 | Val IoU: 0.4386 | Val Acc: 0.8086
+Best model saved!
+Epoch 28 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:42<00:00,  1.35it/s]
+
+Epoch 28 | Train Loss: 1.1983 | Val Loss: 1.2029 | Val IoU: 0.4471 | Val Acc: 0.8132
+Best model saved!
+Epoch 29 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:59<00:00,  1.25it/s]
+
+Epoch 29 | Train Loss: 1.1880 | Val Loss: 1.2129 | Val IoU: 0.4419 | Val Acc: 0.8121
+Epoch 30 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [04:04<00:00,  1.22it/s]
+
+Epoch 30 | Train Loss: 1.1742 | Val Loss: 1.1870 | Val IoU: 0.4519 | Val Acc: 0.8151
+Best model saved!
+Epoch 31 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [04:14<00:00,  1.18it/s]
+
+Epoch 31 | Train Loss: 1.1645 | Val Loss: 1.1809 | Val IoU: 0.4550 | Val Acc: 0.8164
+Best model saved!
+Epoch 32 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [04:40<00:00,  1.07it/s]
+
+Epoch 32 | Train Loss: 1.1568 | Val Loss: 1.1808 | Val IoU: 0.4591 | Val Acc: 0.8154
+Best model saved!
+Epoch 33 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:41<00:00,  1.35it/s]
+
+Epoch 33 | Train Loss: 1.1483 | Val Loss: 1.1701 | Val IoU: 0.4615 | Val Acc: 0.8172
+Best model saved!
+Epoch 34 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:49<00:00,  1.31it/s]
+
+Epoch 34 | Train Loss: 1.1477 | Val Loss: 1.1677 | Val IoU: 0.4601 | Val Acc: 0.8182
+Epoch 35 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:25<00:00,  2.06it/s]
+
+Epoch 35 | Train Loss: 1.1438 | Val Loss: 1.1678 | Val IoU: 0.4611 | Val Acc: 0.8183
+Epoch 36 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:14<00:00,  2.24it/s]
+
+Epoch 36 | Train Loss: 1.1401 | Val Loss: 1.1651 | Val IoU: 0.4617 | Val Acc: 0.8189
+Best model saved!
+Epoch 37 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:32<00:00,  1.97it/s]
+
+Epoch 37 | Train Loss: 1.1389 | Val Loss: 1.1637 | Val IoU: 0.4633 | Val Acc: 0.8190
+Best model saved!
+Epoch 38 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [02:28<00:00,  2.01it/s]
+
+Epoch 38 | Train Loss: 1.1351 | Val Loss: 1.1565 | Val IoU: 0.4664 | Val Acc: 0.8191
+Best model saved!
+Epoch 39 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [56:46<00:00, 11.36s/it]
+
+Epoch 39 | Train Loss: 1.1378 | Val Loss: 1.1607 | Val IoU: 0.4634 | Val Acc: 0.8191
+Epoch 40 Train: 100%|████████████████████████████████████████████████████████████████████████████████████████████████████| 300/300 [03:16<00:00,  1.53it/s]
+
+Epoch 40 | Train Loss: 1.1324 | Val Loss: 1.1648 | Val IoU: 0.4640 | Val Acc: 0.8185
+Final model saved!

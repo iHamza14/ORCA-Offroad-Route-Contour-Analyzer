@@ -175,7 +175,7 @@ python visualize_segmentation.py --mode single --rgb path/to/image.png --seg pat
 ### Hyperparameters
 
 - **Batch Size:** 15
-- **Epochs:** 100
+- **Epochs:** 40
 - **Learning Rate:** 0.001
 - **Optimizer:** Adam
 - **Loss Function:** Cross-Entropy Loss

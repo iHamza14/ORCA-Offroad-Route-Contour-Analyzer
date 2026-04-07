@@ -130,7 +130,7 @@ The model segments 10 primary semantic classes:
 
 * **Input Size:** 512×512 crop
 * **Batch Size:** 8
-* **Epochs:** 50–100
+* **Epochs:** 40–60
 * **Optimizer:** AdamW
 * **Learning Rate:** 1e-4
 * **Weight Decay:** 1e-4
